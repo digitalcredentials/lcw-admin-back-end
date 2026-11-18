@@ -17,14 +17,14 @@ admin loop is three processes, not the wallet's six:
 
 | Process | Port | From |
 | --- | --- | --- |
-| DynamoDB Local | 8000 | `lcw-front-end/scripts/local-stack/up.sh` |
+| DynamoDB Local | 8000 | the `docker run` below |
 | the admin API (this repo) | 3002 | `sam local start-api` |
 | the admin console | 5174 | `lcw-admin-front-end` |
 
-You do **not** need MinIO, `was-server-aws` or `lcw-back-end` to work on this
-repo, even though the container that provides DynamoDB Local lives in the
-wallet's local stack. If you only need the table, start that one container
-directly:
+You do **not** need `was-server-aws` or `lcw-back-end` to work on this repo:
+`add-admin.mjs` creates the admin and audit tables, and `scripts/smoke.mjs`
+creates the accounts table (`lcw-accounts`, keyed by email) when it is
+missing. Start the one container:
 
 ```bash
 docker network create lcw-local 2>/dev/null
@@ -65,12 +65,9 @@ Both parameter overrides are required and neither can be dropped:
 
 Then start the console from `lcw-admin-front-end` — see its `AGENTS.md`.
 
-If you are also running the wallet, bring its stack up first with
-`lcw-front-end/scripts/local-stack/up.sh`, which provides the same
-`lcw-dynamodb` container on the same `lcw-local` network. Note that `up.sh`
-refuses to run while any `sam local` process is alive, including this one,
-because it runs `sam build` and would pull `.aws-sam/build` out from under the
-running containers.
+Port 3002 is only a convention: another local service may hold it (the PWS
+reference server does). Any free port works as long as `ExpectedHost`, the
+console's `VITE_ADMIN_API_BASE_URL` and `smoke.mjs --base` all name it.
 
 ## Tests
 
@@ -84,9 +81,11 @@ that a non-admin is refused, that a signature cannot be replayed against
 another route or method, and that claiming a registered admin's `keyId` without
 their key fails. They need no stack and no credentials.
 
-`scripts/smoke.mjs` needs the API running. It seeds a throwaway account, re-keys
-it, deletes it, and checks both actions were recorded, including the digest swap
-and strip attacks. It never touches accounts it did not create.
+`scripts/smoke.mjs` needs the API running. It seeds two throwaway accounts (one
+that agreed to be contacted, one registered before the question), lists,
+filters and reads them, deletes both, and checks the deletions were recorded
+with the whole row, including the digest strip attack against `POST /login`.
+It never touches accounts it did not create.
 
 **`npm ci` at the root installs `src/authorizer`'s dependencies too**, through a
 `postinstall` hook. It has to: the authorizer keeps its own `package.json` and

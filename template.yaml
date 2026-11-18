@@ -13,7 +13,20 @@ Parameters:
       DynamoDB table of wallet accounts. Owned and declared by the
       lcw-back-end stack - this stack only references it by name, and must
       never declare it, or two stacks would contend for one physical table.
-    Default: wallet-test
+    Default: lcw-accounts
+  ApiDomainName:
+    Type: String
+    Description: >
+      Custom domain the API is served at (e.g. admin-api.lcw-sandbox.org),
+      which ExpectedHost must then name too. Empty for sam local, where no
+      domain, certificate or DNS record is created.
+    Default: ''
+  HostedZoneId:
+    Type: String
+    Description: >
+      Route 53 hosted zone holding ApiDomainName: the certificate is validated
+      and the alias record written there. Required with ApiDomainName.
+    Default: ''
   AdminTableName:
     Type: String
     Description: >
@@ -45,6 +58,9 @@ Parameters:
       sam local container). Left empty in every deployed environment, where the
       functions then build their DynamoDB clients with no endpoint override.
     Default: ''
+
+Conditions:
+  HasApiDomain: !Not [!Equals [!Ref ApiDomainName, '']]
 
 Globals:
   Function:
@@ -107,6 +123,52 @@ Resources:
           - Authorization
           - Content-Type
           - Digest
+
+  # ---- The API's own domain (deployed stacks only)
+
+  # ApiDomainName (admin-api.lcw-sandbox.org): a regional custom domain whose
+  # certificate CloudFormation validates through the hosted zone, mapped to
+  # the $default stage, with an alias record. ExpectedHost must name it.
+  AdminApiCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: HasApiDomain
+    Properties:
+      DomainName: !Ref ApiDomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref ApiDomainName
+          HostedZoneId: !Ref HostedZoneId
+
+  AdminApiDomain:
+    Type: AWS::ApiGatewayV2::DomainName
+    Condition: HasApiDomain
+    Properties:
+      DomainName: !Ref ApiDomainName
+      DomainNameConfigurations:
+        - CertificateArn: !Ref AdminApiCertificate
+          EndpointType: REGIONAL
+          SecurityPolicy: TLS_1_2
+
+  AdminApiMapping:
+    Type: AWS::ApiGatewayV2::ApiMapping
+    Condition: HasApiDomain
+    # The stage SAM generates for an HttpApi with no StageName
+    DependsOn: AdminHttpApiApiGatewayDefaultStage
+    Properties:
+      ApiId: !Ref AdminHttpApi
+      DomainName: !Ref AdminApiDomain
+      Stage: $default
+
+  AdminApiDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasApiDomain
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref ApiDomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt AdminApiDomain.RegionalDomainName
+        HostedZoneId: !GetAtt AdminApiDomain.RegionalHostedZoneId
 
   # ---- Authorization
 
@@ -320,62 +382,6 @@ Resources:
       LogGroupName: /aws/lambda/lcw-admin-account-delete
       RetentionInDays: 30
 
-  # Resets the DID that controls an account. This is a complete handover of the
-  # account and its space, so the previous DID is always recorded.
-  AccountDidPutFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: lcw-admin-account-did-put
-      Description: Replaces the controlling DID of a wallet account
-      # Rooted at src/ for the shared audit recorder, as above.
-      CodeUri: src/
-      Handler: account-did-put/index.handler
-      # As above, and this one also verifies a body digest before it starts.
-      Timeout: 10
-      MemorySize: 256
-      Policies:
-        - Statement:
-            - Effect: Allow
-              Action:
-                - dynamodb:GetItem
-                - dynamodb:UpdateItem
-              Resource: !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AccountTableName}
-            - Effect: Allow
-              Action: dynamodb:PutItem
-              Resource: !GetAtt AuditTable.Arn
-      LoggingConfig:
-        LogGroup: !Ref AccountDidPutLogGroup
-      Events:
-        DidRoute:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref AdminHttpApi
-            Method: PUT
-            Path: /accounts/{email}/did
-    Metadata:
-      # Bundled so the shared audit recorder in src/shared resolves: SAM copies
-      # only this function's CodeUri, so a relative import across directories
-      # has to be inlined at build time. Same mechanism as the authorizer.
-      BuildMethod: esbuild
-      BuildProperties:
-        Minify: false
-        Target: es2022
-        Format: esm
-        Platform: node
-        Sourcemap: false
-        OutExtension:
-          - .js=.mjs
-        EntryPoints:
-          - account-did-put/index.mjs
-        External:
-          - '@aws-sdk/*'
-
-  AccountDidPutLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: /aws/lambda/lcw-admin-account-did-put
-      RetentionInDays: 30
-
   AuditListFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -411,11 +417,18 @@ Resources:
 
   # Admin identities. Keyed by email to mirror the accounts table, but looked
   # up by did (the authorizer's only input), which is what the GSI is for.
+  # Kept if the stack is deleted or a table property forces a replacement, and
+  # recoverable to any second of the last 35 days: who may administer, and
+  # what they did, must outlive any one deploy.
   AdminTable:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       TableName: !Ref AdminTableName
       BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
       AttributeDefinitions:
         - AttributeName: email
           AttributeType: S
@@ -444,9 +457,13 @@ Resources:
   # human actions, not traffic.
   AuditTable:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       TableName: !Ref AuditTableName
       BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
       AttributeDefinitions:
         - AttributeName: targetEmail
           AttributeType: S
@@ -471,8 +488,11 @@ Resources:
 
 Outputs:
   AdminApiUrl:
-    Description: Base URL of the admin API
-    Value: !Sub https://${AdminHttpApi}.execute-api.${AWS::Region}.amazonaws.com
+    Description: Base URL of the admin API (its custom domain when it has one)
+    Value: !If
+      - HasApiDomain
+      - !Sub https://${ApiDomainName}
+      - !Sub https://${AdminHttpApi}.execute-api.${AWS::Region}.amazonaws.com
   AdminTableName:
     Description: Table of admin identities
     Value: !Ref AdminTable

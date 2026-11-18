@@ -10,7 +10,7 @@ import {
 const dynamoClient = new DynamoDBClient(
   process.env.DYNAMO_ENDPOINT_URL ? { endpoint: process.env.DYNAMO_ENDPOINT_URL } : {}
 )
-const ACCOUNT_TABLE_NAME = process.env.ACCOUNT_TABLE_NAME ?? 'wallet-test'
+const ACCOUNT_TABLE_NAME = process.env.ACCOUNT_TABLE_NAME ?? 'lcw-accounts'
 const AUDIT_TABLE_NAME = process.env.AUDIT_TABLE_NAME ?? 'lcw-admin-audit'
 
 
@@ -68,11 +68,14 @@ export const handler = async (event) => {
     return json(404, { error: 'No such account.' })
   }
 
+  // What an admin reads, and the row exactly as stored: `item` is what a
+  // restore puts back, every attribute lcw-back-end keeps on it included
+  // (the registration token sign-in returns, the contact choice).
   const removed = {
     email: account.email?.S,
     did: account.did?.S,
-    spaceURL: account.spaceURL?.S,
-    createdAt: account.CreatedAt?.S
+    createdAt: account.CreatedAt?.S,
+    item: account
   }
 
   // Recorded before the row is removed, and the record carries the whole row.
@@ -140,12 +143,12 @@ export const handler = async (event) => {
     })
   }
 
-  // The account's Wallet Attached Storage space is untouched: this API holds no
-  // S3 permission at all. The space becomes unreachable only because the WAS
-  // authorizer resolves its controller through this row - putting the row back
-  // restores access to it intact.
+  // The account's storage Space is untouched: this API holds no permission
+  // over it, and it stays controlled by the account's own DID. What the
+  // removal ends is signing in: lcw-login answers only an email this table
+  // holds, so the wallet cannot finish a sign-in until the row is put back.
   return json(200, {
     deleted: removed,
-    note: 'The account row was removed. The space and its contents were not touched; restoring this row restores access to them.'
+    note: 'The account row was removed, so this account can no longer sign in to the wallet. Its storage and credentials were not touched; restoring this row restores sign-in.'
   })
 }

@@ -5,7 +5,7 @@ import { DynamoDBClient, ScanCommand } from '@aws-sdk/client-dynamodb'
 const dynamoClient = new DynamoDBClient(
   process.env.DYNAMO_ENDPOINT_URL ? { endpoint: process.env.DYNAMO_ENDPOINT_URL } : {}
 )
-const ACCOUNT_TABLE_NAME = process.env.ACCOUNT_TABLE_NAME ?? 'wallet-test'
+const ACCOUNT_TABLE_NAME = process.env.ACCOUNT_TABLE_NAME ?? 'lcw-accounts'
 const DEFAULT_LIMIT = 50
 const MAX_LIMIT = 200
 
@@ -15,11 +15,15 @@ const json = (statusCode, body) => ({
   body: JSON.stringify(body)
 })
 
+// The account as an admin sees it. contactOptIn is the tester's answer to
+// "Contact me with news and updates", which lcw-back-end keeps on the row; a
+// row without it (an account registered before the question) reads as no.
 const toAccount = (item) => ({
   email: item.email?.S,
   did: item.did?.S,
-  spaceURL: item.spaceURL?.S,
-  createdAt: item.CreatedAt?.S
+  createdAt: item.CreatedAt?.S,
+  contactOptIn: item.contactOptIn?.BOOL === true,
+  contactOptInUpdatedAt: item.contactOptInUpdatedAt?.S
 })
 
 // A cursor is just DynamoDB's LastEvaluatedKey, opaque to the client.
@@ -56,12 +60,28 @@ export const handler = async (event) => {
     ? Math.min(Math.max(Math.floor(requested), 1), MAX_LIMIT)
     : DEFAULT_LIMIT
   const query = (params.q ?? '').trim()
+  // ?contact=agreed: only the testers who agreed to be contacted
+  if (params.contact !== undefined && params.contact !== 'agreed') {
+    return json(400, { error: 'contact, when given, must be "agreed".' })
+  }
+  const agreedOnly = params.contact === 'agreed'
 
   let exclusiveStartKey
   try {
     exclusiveStartKey = decodeCursor(params.cursor)
   } catch {
     return json(400, { error: 'Invalid cursor.' })
+  }
+
+  const filters = []
+  const values = {}
+  if (query) {
+    filters.push('(contains(email, :q) OR contains(did, :q))')
+    values[':q'] = { S: query }
+  }
+  if (agreedOnly) {
+    filters.push('contactOptIn = :agreed')
+    values[':agreed'] = { BOOL: true }
   }
 
   // The accounts table is keyed by email with no secondary indexes, and it
@@ -71,12 +91,8 @@ export const handler = async (event) => {
     TableName: ACCOUNT_TABLE_NAME,
     Limit: limit,
     ExclusiveStartKey: exclusiveStartKey,
-    ...(query
-      ? {
-          FilterExpression:
-            'contains(email, :q) OR contains(did, :q) OR contains(spaceURL, :q)',
-          ExpressionAttributeValues: { ':q': { S: query } }
-        }
+    ...(filters.length
+      ? { FilterExpression: filters.join(' AND '), ExpressionAttributeValues: values }
       : {})
   })
 

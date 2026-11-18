@@ -1,7 +1,7 @@
 # LCW Admin API
 
 Administration of **Learner Credential Wallet accounts**: viewing them,
-searching them, deleting them, and resetting the DID that controls one. An
+searching them, listing who agreed to be contacted, and deleting them. An
 HTTP API of AWS Lambda functions behind a zcap-signature authorizer, deployed
 with AWS SAM. The console that drives it is
 [lcw-admin-front-end](https://github.com/digitalcredentials/lcw-admin-front-end).
@@ -13,15 +13,18 @@ is not a general back office, and it is not where credentials live.
 
 The wallet is three repos - [lcw-front-end][fe], [lcw-back-end][be] and
 [was-server-aws][was] - and this is a fourth that shares exactly one thing with
-them: **the accounts table**. That table holds an email, the `did:key` that
-controls the account, the URL of the account's Wallet Attached Storage space,
-and a creation timestamp. Four fields. That is the whole of what can be
-administered here.
+them: **the accounts table** (`lcw-accounts`). That table holds an email, the
+`did:webvh` the account registered, the registration token sign-in hands
+back, timestamps, and the tester's answer to "Contact me with news and
+updates" (`contactOptIn`, `contactOptInUpdatedAt`; a row without them, an
+account registered before the question, reads as not agreed). That is the
+whole of what can be administered here.
 
-Credentials are not in it. They live in the account's WAS space, which is a
-separate system that this API holds **no permission of any kind over** - no S3
-policy, not even read. An admin can revoke someone's access to their space. An
-admin cannot open it, copy it, or destroy it.
+Credentials are not in it. They live, encrypted, in the account's storage
+Space on the PWS server, which this API holds **no permission of any kind
+over** - no S3 policy, not even read - and which stays controlled by the
+account's own keys. An admin can stop an account signing in. An admin cannot
+open its storage, copy it, or destroy it.
 
 [fe]: https://github.com/digitalcredentials/lcw-front-end
 [be]: https://github.com/digitalcredentials/lcw-back-end
@@ -32,13 +35,12 @@ admin cannot open it, copy it, or destroy it.
 | Method | Path | What it does |
 | --- | --- | --- |
 | POST | `/login` | Reports which admin the caller proved they are |
-| GET | `/accounts` | One page of accounts; `?q=` filters, `?cursor=` continues |
+| GET | `/accounts` | One page of accounts; `?q=` searches email and DID, `?contact=agreed` keeps those who agreed to be contacted, `?cursor=` continues |
 | GET | `/accounts/{email}` | One account, with everything admins have done to it |
 | DELETE | `/accounts/{email}` | Removes the account row, recording it first |
-| PUT | `/accounts/{email}/did` | Replaces the controlling DID |
 | GET | `/audit` | Recorded admin actions, newest first; `?limit=` and `?cursor=` page |
 
-Three tables are involved. `wallet-test` (the accounts) is **owned by the
+Three tables are involved. `lcw-accounts` (the accounts) is **owned by the
 lcw-back-end stack**; this stack references it by name through the
 `AccountTableName` parameter and never declares it, because two stacks
 declaring one table would contend over it. `lcw-admin` and `lcw-admin-audit`
@@ -60,7 +62,7 @@ modes therefore are: not registered, or cannot sign. Both come back as a bare
 403.
 
 **Admins are their own table.** An admin is not a wallet account with a flag
-set - `wallet-test` has no column this API consults for privilege - so no
+set - `lcw-accounts` has no column this API consults for privilege - so no
 wallet account can be escalated into an admin, by this API or by anything that
 writes to that table.
 
@@ -85,11 +87,11 @@ accepting defaults would ship with the pinning silently off. Locally, pass
 `ExpectedHost=localhost:3002`; it must match the host the console actually calls,
 letter case aside.
 
-**A request body is authenticated in two places, and needs both.** An HTTP API
+**A request body has to be authenticated in two places.** An HTTP API
 authorizer event carries headers but no body, so verifying the signature proves
 the signed `Digest` header is genuine while proving nothing about the bytes that
-actually arrived; the handler therefore re-checks the body against that digest
-and refuses a mismatch.
+actually arrived. No handler acts on a body today, but one that does must
+re-check it against that digest and refuse a mismatch.
 
 That is only worth anything if the digest was signed, and by default it is not
 always required to be. `@interop/http-signature-zcap-verify` adds `digest` to
@@ -97,13 +99,12 @@ the headers a signature must cover **only when the request carries a
 `Content-Type`** - and the caller chooses whether to send one. So the authorizer
 requires `digest` explicitly for every body-carrying method (`POST`, `PUT`,
 `PATCH`). Without that, a signature made over a bodyless request to the same
-target could be replayed with any body and a matching attacker-computed digest:
-the handler's comparison would succeed against the attacker's own number, and
-the account would be handed over, recorded against the admin who signed.
+target could be replayed with any body and a matching attacker-computed digest,
+and a handler's own comparison would succeed against the attacker's number.
 
-Both halves are tested - the authorizer refuses a body-carrying signature that
-does not cover a digest, and `scripts/smoke.mjs` runs the full swap and strip
-attacks against the running API.
+The authorizer refuses a body-carrying signature that does not cover a digest,
+and `scripts/smoke.mjs` runs that strip attack against the running API's
+`POST /login`.
 
 ## Every action is recorded
 
@@ -134,59 +135,50 @@ if the authorizer context is missing, the handler refuses rather than writing an
 anonymous record.
 
 The record is written **before** the account is touched, and it carries enough
-to undo the action:
-
-- a deletion stores the entire row that was removed, so putting it back
-  restores the account and its access to its space, intact
-- a DID reset stores the previous DID, so the handover can be reversed
+to undo the action: a deletion stores the row that was removed exactly as it
+was stored (`detail.removed.item`, every attribute lcw-back-end keeps on it,
+the registration token and the contact choice included), so putting it back
+restores the account's sign-in intact.
 
 Two consequences follow, both intended. A failure to record aborts the action
 rather than performing it unrecorded. And an action that is recorded but then
 fails would leave a record of something that did not happen - so the handler
-appends a second record saying so (`account.delete.aborted`,
-`account.did.reset.aborted`). The log is only ever added to, so a correction is
-another entry, never an edit.
+appends a second record saying so (`account.delete.aborted`). The log is only
+ever added to, so a correction is another entry, never an edit.
 
-The write itself is conditional on what was read: a DID reset only applies if
-the account still holds the DID the record names as the previous one. A reset
-racing another change returns 409 rather than overwriting a key the log does not
-mention - which would have made the recorded undo restore the wrong one.
+The write itself is conditional on what was read: a deletion only applies if
+the account still holds the DID the record names. A deletion racing another
+change returns 409 rather than removing a row the log does not describe -
+which would have made the recorded undo restore the wrong one.
 
 Granting and revoking admin rights is recorded too, by `add-admin.mjs`, marked
 as unauthenticated because it is - that script is run by whoever holds AWS
 credentials, and nothing about it is signed. Without those entries, an audit row
 naming a DID could not be tied to a person once that admin was removed.
 
-## Resetting a controlling DID is a handover
+## There is no DID reset
 
-Whoever holds the new key controls the account and everything in its space,
-immediately and silently: `lcw-login` reads the DID from this row, and the WAS
-authorizer resolves the space's controller through this same row. It is the
-strongest thing an admin can do here.
+An earlier version could replace the DID on an account's row, which handed the
+account over when the storage server read its controller from this table. It
+no longer does: an account is a `did:webvh` that controls its own storage
+Space, and the row's DID only decides who passes lcw-back-end's sign-in check.
+Replacing it would lock the tester out of the wallet and let the new key's
+holder pass that check without reaching the account's data, so the route is
+gone. A tester who loses their password recovers through the wallet's own
+recovery codes.
 
-So the API takes a `did:key` and validates it strictly - an Ed25519
-`did:key:z6Mk...` and nothing else. A typo would hand the account to a key
-nobody holds, and neither its owner nor an admin could ever sign for it again.
+## Who agreed to be contacted
 
-The privacy-respecting flow is that the **account holder generates their own
-key and hands over only the public DID**, so their passphrase never leaves
-their machine. The wallet has no screen that shows someone their DID yet, which
-is the gap that makes the alternative - an admin choosing a passphrase and
-reading it out - necessary for now. That alternative means an admin briefly
-holds a credential that opens someone's wallet, and the console says so plainly
-where it offers it.
-
-One known loose end: the space's own `metadata/description.json` records a
-`controller`, seeded at registration. The WAS authorizer does not consult it -
-it reads this table - so a reset takes effect immediately, but
-`GET /space/{id}` will still report the old controller. Correcting it would
-require write access to the space, which this API deliberately does not have.
+The register page asks "Contact me with news and updates", unticked by
+default, and testers change their answer in the wallet's Settings; lcw-back-end
+keeps it on the account row. `GET /accounts?contact=agreed` keeps only the
+accounts that said yes, with when (`contactOptInUpdatedAt`), and the console's
+Accounts page lists them and downloads them as a CSV.
 
 ## Running it locally
 
-The local stack lives in [lcw-front-end][fe] - see its `AGENTS.md` - and
-substitutes DynamoDB Local for the real table, so nothing here needs AWS
-credentials. Bring that up first, then:
+DynamoDB Local stands in for the real tables, so nothing here needs AWS
+credentials. Start it as `AGENTS.md` shows, then:
 
 ```bash
 npm ci                           # scripts and tests, authorizer deps included
@@ -196,7 +188,7 @@ sam build
 node scripts/add-admin.mjs --endpoint-url http://localhost:8000 \
   --email you@example.org --passphrase 'a long passphrase'
 
-# the admin API, on :3002
+# the admin API, on :3002 (any free port, as long as ExpectedHost names it)
 sam local start-api --port 3002 --region us-east-1 \
   --docker-network lcw-local \
   --parameter-overrides DynamoEndpointUrl=http://lcw-dynamodb:8000 ExpectedHost=localhost:3002 \
@@ -215,19 +207,22 @@ record of changes, not of invocations. A grant or revocation is recorded
 **before** it is applied, as in the API, and a missing audit table aborts the
 change rather than proceeding unrecorded.
 
-`--passphrase` derives the DID exactly as the wallet does
-(`SHA-256(passphrase)` as the Ed25519 seed). Prefer `--did` outside local
-development, so the passphrase never leaves the admin's machine.
+`--passphrase` derives the DID exactly as the console's sign-in does
+(`SHA-256(passphrase)` as the Ed25519 seed); an admin's key has nothing to do
+with any wallet account's. Prefer `--did` outside local development, so the
+passphrase never leaves the admin's machine.
 
 Then exercise the whole API end to end:
 
 ```bash
-node scripts/smoke.mjs --passphrase 'a long passphrase'
+node scripts/smoke.mjs --passphrase 'a long passphrase'   # --base http://localhost:PORT for another port
 ```
 
-It seeds a throwaway account of its own, re-keys it, deletes it, and checks
-that both actions were recorded. It never touches accounts it did not create,
-so it is safe to run alongside the wallet's local stack.
+It creates the local `lcw-accounts` table if it is missing, seeds two
+throwaway accounts of its own (one that agreed to be contacted, one registered
+before the question), lists, filters and reads them, deletes both, and checks
+that the deletions were recorded with the whole row. It never touches accounts
+it did not create.
 
 ## Tests
 
@@ -267,21 +262,33 @@ so far only been saved by an older resolved `undici`.)
 
 ## Deploying
 
-Not yet done, and not to be done casually: the accounts table is shared with a
-live sandbox.
+Not to be done casually: the accounts table is shared with a live sandbox. The
+sandbox serves this API at `admin-api.lcw-sandbox.org` and the console at
+`admin.lcw-sandbox.org`:
 
-- `AccountTableName` defaults to `wallet-test`. That default is the test table,
-  and it is the wrong one to administer by accident - set it explicitly.
-- `ExpectedHost` has no default and must be the host the console will call. The
-  stack creates only an `execute-api` host, whose name is not known until it
-  exists, so a first deploy needs either a custom domain decided up front or a
-  second deploy once `AdminApiUrl` is known.
+```bash
+sam build
+sam deploy --stack-name lcw-admin-api --resolve-s3 --capabilities CAPABILITY_IAM \
+  --parameter-overrides AccountTableName=lcw-accounts \
+    ApiDomainName=admin-api.lcw-sandbox.org HostedZoneId=Z04250862QG6MQUAE24XV \
+    ExpectedHost=admin-api.lcw-sandbox.org
+```
+
+- `AccountTableName` defaults to `lcw-accounts`, lcw-back-end's table; name it
+  explicitly anyway, since it is the one table here that is not this stack's.
+- `ApiDomainName` and `HostedZoneId` make the stack create the custom domain,
+  its certificate (validated through the zone) and the alias record, so the
+  host is known before the first deploy. `ExpectedHost` has no default and must
+  name the same host.
 - Register the first admin with `add-admin.mjs` against the deployed
-  `lcw-admin` table; the console cannot be used at all until one exists.
-- Neither table sets `DeletionPolicy: Retain` or point-in-time recovery. Before
-  this is used for anything that matters, it should: `TableName` is a
-  replacement-triggering property, so renaming a table parameter would delete
-  the audit log rather than rename it.
+  `lcw-admin` table (no `--endpoint-url`, AWS credentials for the account, and
+  `--did` rather than `--passphrase`); the console cannot be used at all until
+  one exists.
+- Both tables this stack declares keep `DeletionPolicy: Retain` and
+  `UpdateReplacePolicy: Retain` with point-in-time recovery, so deleting the
+  stack or renaming a table parameter leaves the admin list and the audit log
+  in place rather than deleting them; a replaced table has to be imported or
+  restored by hand.
 - `recent-index` is sparse on the `log` attribute, which every record written by
   this code carries. If a deployment ever predates that attribute, its older
   records will be missing from `GET /audit` (though still visible under the

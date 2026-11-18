@@ -5,7 +5,7 @@ import { DynamoDBClient, GetItemCommand, QueryCommand } from '@aws-sdk/client-dy
 const dynamoClient = new DynamoDBClient(
   process.env.DYNAMO_ENDPOINT_URL ? { endpoint: process.env.DYNAMO_ENDPOINT_URL } : {}
 )
-const ACCOUNT_TABLE_NAME = process.env.ACCOUNT_TABLE_NAME ?? 'wallet-test'
+const ACCOUNT_TABLE_NAME = process.env.ACCOUNT_TABLE_NAME ?? 'lcw-accounts'
 const AUDIT_TABLE_NAME = process.env.AUDIT_TABLE_NAME ?? 'lcw-admin-audit'
 
 const json = (statusCode, body) => ({
@@ -82,8 +82,10 @@ export const handler = async (event) => {
       ? {
           email: account.email?.S,
           did: account.did?.S,
-          spaceURL: account.spaceURL?.S,
-          createdAt: account.CreatedAt?.S
+          createdAt: account.CreatedAt?.S,
+          // As in the list: a row without it reads as no
+          contactOptIn: account.contactOptIn?.BOOL === true,
+          contactOptInUpdatedAt: account.contactOptInUpdatedAt?.S
         }
       : null,
     history: history.map((entry) => ({

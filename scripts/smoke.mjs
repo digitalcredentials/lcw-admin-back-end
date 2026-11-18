@@ -4,14 +4,16 @@
 //
 //   node scripts/smoke.mjs --passphrase 'admin-secret-seed-that-is-long-e'
 //
-// It seeds a throwaway wallet account directly in DynamoDB, then reads,
-// re-keys and deletes it through the API. It never touches accounts it did not
-// create, so it is safe to run alongside the wallet's own local stack.
+// It seeds two throwaway wallet accounts directly in DynamoDB (one that agreed
+// to be contacted, one registered before the question was asked), then lists,
+// filters, reads and deletes them through the API. It never touches accounts
+// it did not create, so it is safe to run alongside the wallet's own local
+// stack.
 import '@interop/http-client'
 import { signCapabilityInvocation } from '@interop/http-signature-zcap-invoke'
 import { createHeaderValue } from '@interop/http-digest-header'
 import { Ed25519VerificationKey } from '@interop/ed25519-verification-key'
-import { DynamoDBClient, PutItemCommand, GetItemCommand } from '@aws-sdk/client-dynamodb'
+import { DynamoDBClient, PutItemCommand, GetItemCommand, CreateTableCommand } from '@aws-sdk/client-dynamodb'
 
 const args = Object.fromEntries(
   process.argv.slice(2).reduce((pairs, arg, i, all) => {
@@ -22,9 +24,10 @@ const args = Object.fromEntries(
 
 const BASE = (args.base ?? 'http://localhost:3002').replace(/\/+$/, '')
 const ENDPOINT = args['endpoint-url'] ?? 'http://localhost:8000'
-const ACCOUNT_TABLE = args['account-table'] ?? 'wallet-test'
+const ACCOUNT_TABLE = args['account-table'] ?? 'lcw-accounts'
 const PASSPHRASE = args.passphrase ?? 'admin-secret-seed-that-is-long-e'
-const TEST_EMAIL = args.email ?? 'smoke-test@example.org'
+const AGREED_EMAIL = args.email ?? 'smoke-test@example.org'
+const EARLIER_EMAIL = AGREED_EMAIL.replace('@', '+earlier@')
 
 const dynamo = new DynamoDBClient({
   region: 'us-east-1',
@@ -43,15 +46,8 @@ async function keyFromPassphrase (passphrase) {
 const adminKey = await keyFromPassphrase(PASSPHRASE)
 // A second key, held by nobody the admin table knows about.
 const strangerKey = await keyFromPassphrase('not-an-admin-passphrase-at-all!!')
-// Stands in for the account owner's new key after a reset.
-const newOwnerKey = await keyFromPassphrase('the accounts brand new passphrase')
-// The key someone replaying a captured request would try to substitute.
-const attackerKey = await keyFromPassphrase('the key an attacker would swap in')
 
-// `sendInstead` swaps the body after signing, which is what an attacker who
-// captured a valid set of headers would do. The signed digest covers the
-// original body, so the swap has to be refused.
-async function call (method, path, { json, key = adminKey, sendInstead } = {}) {
+async function call (method, path, { json, key = adminKey } = {}) {
   const url = `${BASE}${path}`
   const headers = await signCapabilityInvocation({
     url,
@@ -61,11 +57,10 @@ async function call (method, path, { json, key = adminKey, sendInstead } = {}) {
     capabilityAction: method,
     invocationSigner: key.signer()
   })
-  const sentBody = sendInstead ?? json
   const response = await fetch(url, {
     method,
     headers: { ...headers, ...(json ? { 'content-type': 'application/json' } : {}) },
-    ...(sentBody ? { body: JSON.stringify(sentBody) } : {})
+    ...(json ? { body: JSON.stringify(json) } : {})
   })
   const text = await response.text()
   let body
@@ -94,18 +89,43 @@ function check (name, condition, detail) {
 console.log(`Admin DID: ${adminKey.controller}`)
 console.log(`Against:   ${BASE}\n`)
 
-// Seed the throwaway account directly: creating wallet accounts is not
-// something the admin API can do, by design.
-await dynamo.send(new PutItemCommand({
-  TableName: ACCOUNT_TABLE,
-  Item: {
-    email: { S: TEST_EMAIL },
+// The accounts table is lcw-back-end's; against DynamoDB Local alone it does
+// not exist yet, so it is created here in its shape (keyed by email).
+try {
+  await dynamo.send(new CreateTableCommand({
+    TableName: ACCOUNT_TABLE,
+    AttributeDefinitions: [{ AttributeName: 'email', AttributeType: 'S' }],
+    KeySchema: [{ AttributeName: 'email', KeyType: 'HASH' }],
+    BillingMode: 'PAY_PER_REQUEST'
+  }))
+  console.log(`Created the local ${ACCOUNT_TABLE} table`)
+} catch (error) {
+  if (error.name !== 'ResourceInUseException') throw error
+}
+
+// Seeded directly, in the shape lcw-back-end writes: creating wallet accounts
+// is not something the admin API can do, by design.
+const agreedAt = new Date().toISOString()
+for (const item of [
+  {
+    email: { S: AGREED_EMAIL },
     did: { S: strangerKey.controller },
-    spaceURL: { S: 'http://localhost:3000/space/dcc-was-smoke-test' },
-    CreatedAt: { S: new Date().toISOString() }
+    token: { S: 'smoke-registration-code' },
+    confirmationKey: { S: 'none' },
+    CreatedAt: { S: agreedAt },
+    contactOptIn: { BOOL: true },
+    contactOptInUpdatedAt: { S: agreedAt }
+  },
+  {
+    email: { S: EARLIER_EMAIL },
+    did: { S: strangerKey.controller },
+    token: { S: 'smoke-registration-code' },
+    CreatedAt: { S: agreedAt }
   }
-}))
-console.log(`Seeded ${TEST_EMAIL}\n`)
+]) {
+  await dynamo.send(new PutItemCommand({ TableName: ACCOUNT_TABLE, Item: item }))
+}
+console.log(`Seeded ${AGREED_EMAIL} and ${EARLIER_EMAIL}\n`)
 
 // A body, even an empty one: the authorizer requires body-carrying methods to
 // sign a digest, so an unsigned-body POST is refused by design.
@@ -116,17 +136,17 @@ check('POST /login identifies the admin', login.status === 200 && login.body.did
 // signature cannot cover a digest it never had, so the authorizer refuses it
 // before any handler sees it.
 const stripped = await (async () => {
-  const url = `${BASE}/accounts/${pathSegment(TEST_EMAIL)}/did`
+  const url = `${BASE}/login`
   const headers = await signCapabilityInvocation({
     url,
-    method: 'PUT',
+    method: 'POST',
     headers: { host: new URL(url).host },
-    capabilityAction: 'PUT',
+    capabilityAction: 'POST',
     invocationSigner: adminKey.signer()
   })
-  const body = JSON.stringify({ did: attackerKey.controller })
+  const body = JSON.stringify({ injected: true })
   const digest = await createHeaderValue({ data: new TextEncoder().encode(body) })
-  const response = await fetch(url, { method: 'PUT', headers: { ...headers, digest }, body })
+  const response = await fetch(url, { method: 'POST', headers: { ...headers, digest, 'content-type': 'application/json' }, body })
   return response.status
 })()
 check('a body added to a signature that never covered one is refused', stripped === 403, stripped)
@@ -141,77 +161,63 @@ check('an unsigned request is refused', unsigned.status === 401, unsigned.status
 
 const list = await call('GET', '/accounts')
 check('GET /accounts lists accounts', list.status === 200 && Array.isArray(list.body.accounts), list)
-check('the seeded account is listed', (list.body.accounts ?? []).some(a => a.email === TEST_EMAIL), list.body)
+check('the seeded accounts are listed', [AGREED_EMAIL, EARLIER_EMAIL].every(email =>
+  (list.body.accounts ?? []).some(a => a.email === email)), list.body)
 
 const search = await call('GET', '/accounts?q=smoke-test')
 check('GET /accounts?q= filters', search.status === 200 && (search.body.accounts ?? []).every(a =>
-  `${a.email}${a.did}${a.spaceURL}`.includes('smoke-test')), search)
+  `${a.email}${a.did}`.includes('smoke-test')), search)
 
-const got = await call('GET', `/accounts/${pathSegment(TEST_EMAIL)}`)
-check('GET /accounts/{email} reads one account', got.status === 200 && got.body.account?.did === strangerKey.controller, got)
+const agreed = await call('GET', '/accounts?q=smoke-test&contact=agreed')
+check('GET /accounts?contact=agreed lists only those who agreed to be contacted', agreed.status === 200 &&
+  (agreed.body.accounts ?? []).some(a => a.email === AGREED_EMAIL && a.contactOptIn === true && a.contactOptInUpdatedAt === agreedAt) &&
+  !(agreed.body.accounts ?? []).some(a => a.email === EARLIER_EMAIL) &&
+  (agreed.body.accounts ?? []).every(a => a.contactOptIn === true), agreed.body)
 
-const badDid = await call('PUT', `/accounts/${pathSegment(TEST_EMAIL)}/did`, { json: { did: 'did:key:nonsense' } })
-check('a malformed DID is refused', badDid.status === 400, badDid)
+const badFilter = await call('GET', '/accounts?contact=yes')
+check('any other contact filter is refused', badFilter.status === 400, badFilter)
 
-// The authorizer is given headers but never the body, so the body has to be
-// authenticated by the handler against the digest the admin signed. Without
-// that, these captured headers would re-key the account to whoever replayed
-// them, recorded against the admin who signed.
-const tampered = await call('PUT', `/accounts/${pathSegment(TEST_EMAIL)}/did`, {
-  json: { did: newOwnerKey.controller, reason: 'legitimate' },
-  sendInstead: { did: attackerKey.controller, reason: 'swapped in transit' }
-})
-check('a body swapped after signing is refused', tampered.status === 401, tampered)
+const got = await call('GET', `/accounts/${pathSegment(AGREED_EMAIL)}`)
+check('GET /accounts/{email} reads one account, with its contact choice', got.status === 200 &&
+  got.body.account?.did === strangerKey.controller && got.body.account?.contactOptIn === true, got)
 
-const afterTamper = await dynamo.send(new GetItemCommand({
-  TableName: ACCOUNT_TABLE, Key: { email: { S: TEST_EMAIL } }
-}))
-check('the tampered request changed nothing',
-  afterTamper.Item?.did?.S === strangerKey.controller, afterTamper.Item?.did?.S)
+const earlier = await call('GET', `/accounts/${pathSegment(EARLIER_EMAIL)}`)
+check('an account registered before the question reads as not agreed', earlier.status === 200 &&
+  earlier.body.account?.contactOptIn === false && earlier.body.account?.contactOptInUpdatedAt === undefined, earlier)
 
-const reset = await call('PUT', `/accounts/${pathSegment(TEST_EMAIL)}/did`, {
-  json: { did: newOwnerKey.controller, reason: 'smoke test' }
-})
-check('PUT /accounts/{email}/did resets the DID', reset.status === 200 && reset.body.did === newOwnerKey.controller, reset)
+const deletedEarlier = await call('DELETE', `/accounts/${pathSegment(EARLIER_EMAIL)}`)
+check('DELETE /accounts/{email} removes the row', deletedEarlier.status === 200 && deletedEarlier.body.deleted?.email === EARLIER_EMAIL, deletedEarlier)
 
-const afterReset = await dynamo.send(new GetItemCommand({
-  TableName: ACCOUNT_TABLE, Key: { email: { S: TEST_EMAIL } }
-}))
-check('the table shows the new DID', afterReset.Item?.did?.S === newOwnerKey.controller, afterReset.Item)
-
-const history = await call('GET', `/accounts/${pathSegment(TEST_EMAIL)}`)
-check('the reset is recorded against the account', (history.body.history ?? []).some(
-  h => h.action === 'account.did.reset' && h.adminDid === adminKey.controller &&
-       h.detail?.previousDid === strangerKey.controller), history.body.history)
-
-const deleted = await call('DELETE', `/accounts/${pathSegment(TEST_EMAIL)}`)
-check('DELETE /accounts/{email} removes the row', deleted.status === 200 && deleted.body.deleted?.email === TEST_EMAIL, deleted)
+const deleted = await call('DELETE', `/accounts/${pathSegment(AGREED_EMAIL)}`)
+check('a second deletion', deleted.status === 200 && deleted.body.deleted?.email === AGREED_EMAIL, deleted)
 
 const afterDelete = await dynamo.send(new GetItemCommand({
-  TableName: ACCOUNT_TABLE, Key: { email: { S: TEST_EMAIL } }
+  TableName: ACCOUNT_TABLE, Key: { email: { S: AGREED_EMAIL } }
 }))
 check('the row is gone', afterDelete.Item === undefined, afterDelete.Item)
 
-const gone = await call('GET', `/accounts/${pathSegment(TEST_EMAIL)}`)
-check('a deleted account still has its history', gone.status === 404 && (gone.body.history ?? []).some(
-  h => h.action === 'account.delete' && h.detail?.removed?.spaceURL), gone.body)
+const gone = await call('GET', `/accounts/${pathSegment(AGREED_EMAIL)}`)
+check('a deleted account still has its history, holding the whole row', gone.status === 404 && (gone.body.history ?? []).some(
+  h => h.action === 'account.delete' && h.detail?.removed?.item?.token?.S === 'smoke-registration-code' &&
+       h.detail?.removed?.item?.contactOptIn?.BOOL === true), gone.body)
 
 const audit = await call('GET', '/audit')
-check('GET /audit lists both actions newest first', audit.status === 200 &&
-  audit.body.entries?.[0]?.action === 'account.delete' &&
-  audit.body.entries?.[1]?.action === 'account.did.reset', audit.body.entries?.slice(0, 2))
+check('GET /audit lists both deletions newest first', audit.status === 200 &&
+  audit.body.entries?.[0]?.action === 'account.delete' && audit.body.entries?.[0]?.targetEmail === AGREED_EMAIL &&
+  audit.body.entries?.[1]?.action === 'account.delete' && audit.body.entries?.[1]?.targetEmail === EARLIER_EMAIL,
+  audit.body.entries?.slice(0, 2))
 
 // Paged through the time-ordered index, so "newest first" holds across pages
 // rather than only within one.
 const firstPage = await call('GET', '/audit?limit=1')
 check('GET /audit pages, newest first', firstPage.status === 200 &&
   firstPage.body.entries?.length === 1 &&
-  firstPage.body.entries[0].action === 'account.delete' &&
+  firstPage.body.entries[0].targetEmail === AGREED_EMAIL &&
   Boolean(firstPage.body.nextCursor), firstPage.body)
 
 const secondPage = await call('GET', `/audit?limit=1&cursor=${encodeURIComponent(firstPage.body.nextCursor ?? '')}`)
 check('the next page continues where the first left off', secondPage.status === 200 &&
-  secondPage.body.entries?.[0]?.action === 'account.did.reset', secondPage.body.entries)
+  secondPage.body.entries?.[0]?.targetEmail === EARLIER_EMAIL, secondPage.body.entries)
 
 console.log(failures === 0 ? '\nAll checks passed.' : `\n${failures} check(s) failed.`)
 process.exit(failures === 0 ? 0 : 1)
