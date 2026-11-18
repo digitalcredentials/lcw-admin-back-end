@@ -168,14 +168,11 @@ const search = await call('GET', '/accounts?q=smoke-test')
 check('GET /accounts?q= filters', search.status === 200 && (search.body.accounts ?? []).every(a =>
   `${a.email}${a.did}`.includes('smoke-test')), search)
 
-const agreed = await call('GET', '/accounts?q=smoke-test&contact=agreed')
-check('GET /accounts?contact=agreed lists only those who agreed to be contacted', agreed.status === 200 &&
-  (agreed.body.accounts ?? []).some(a => a.email === AGREED_EMAIL && a.contactOptIn === true && a.contactOptInUpdatedAt === agreedAt) &&
-  !(agreed.body.accounts ?? []).some(a => a.email === EARLIER_EMAIL) &&
-  (agreed.body.accounts ?? []).every(a => a.contactOptIn === true), agreed.body)
-
-const badFilter = await call('GET', '/accounts?contact=yes')
-check('any other contact filter is refused', badFilter.status === 400, badFilter)
+const listed = (email) => (search.body.accounts ?? []).find(a => a.email === email)
+check('the list carries each account\'s contact choice', listed(AGREED_EMAIL)?.contactOptIn === true &&
+  listed(AGREED_EMAIL)?.contactOptInUpdatedAt === agreedAt &&
+  listed(EARLIER_EMAIL)?.contactOptIn === false && listed(EARLIER_EMAIL)?.contactOptInUpdatedAt === undefined,
+  search.body.accounts)
 
 const got = await call('GET', `/accounts/${pathSegment(AGREED_EMAIL)}`)
 check('GET /accounts/{email} reads one account, with its contact choice', got.status === 200 &&

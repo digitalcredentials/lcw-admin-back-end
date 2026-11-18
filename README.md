@@ -35,7 +35,7 @@ open its storage, copy it, or destroy it.
 | Method | Path | What it does |
 | --- | --- | --- |
 | POST | `/login` | Reports which admin the caller proved they are |
-| GET | `/accounts` | One page of accounts; `?q=` searches email and DID, `?contact=agreed` keeps those who agreed to be contacted, `?cursor=` continues |
+| GET | `/accounts` | One page of accounts; `?q=` searches email and DID, `?limit=` sizes the page (at most 200), `?cursor=` continues |
 | GET | `/accounts/{email}` | One account, with everything admins have done to it |
 | DELETE | `/accounts/{email}` | Removes the account row, recording it first |
 | GET | `/audit` | Recorded admin actions, newest first; `?limit=` and `?cursor=` page |
@@ -171,9 +171,11 @@ recovery codes.
 
 The register page asks "Contact me with news and updates", unticked by
 default, and testers change their answer in the wallet's Settings; lcw-back-end
-keeps it on the account row. `GET /accounts?contact=agreed` keeps only the
-accounts that said yes, with when (`contactOptInUpdatedAt`), and the console's
-Accounts page lists them and downloads them as a CSV.
+keeps it on the account row. `GET /accounts` returns it on every account
+(`contactOptIn`, and `contactOptInUpdatedAt` for when). The console loads every
+account, filters and searches them in the browser, and exports the filtered
+rows as a CSV, so "who agreed to be contacted" is its Contact column set to
+Agreed.
 
 ## Running it locally
 

@@ -60,28 +60,12 @@ export const handler = async (event) => {
     ? Math.min(Math.max(Math.floor(requested), 1), MAX_LIMIT)
     : DEFAULT_LIMIT
   const query = (params.q ?? '').trim()
-  // ?contact=agreed: only the testers who agreed to be contacted
-  if (params.contact !== undefined && params.contact !== 'agreed') {
-    return json(400, { error: 'contact, when given, must be "agreed".' })
-  }
-  const agreedOnly = params.contact === 'agreed'
 
   let exclusiveStartKey
   try {
     exclusiveStartKey = decodeCursor(params.cursor)
   } catch {
     return json(400, { error: 'Invalid cursor.' })
-  }
-
-  const filters = []
-  const values = {}
-  if (query) {
-    filters.push('(contains(email, :q) OR contains(did, :q))')
-    values[':q'] = { S: query }
-  }
-  if (agreedOnly) {
-    filters.push('contactOptIn = :agreed')
-    values[':agreed'] = { BOOL: true }
   }
 
   // The accounts table is keyed by email with no secondary indexes, and it
@@ -91,8 +75,11 @@ export const handler = async (event) => {
     TableName: ACCOUNT_TABLE_NAME,
     Limit: limit,
     ExclusiveStartKey: exclusiveStartKey,
-    ...(filters.length
-      ? { FilterExpression: filters.join(' AND '), ExpressionAttributeValues: values }
+    ...(query
+      ? {
+          FilterExpression: 'contains(email, :q) OR contains(did, :q)',
+          ExpressionAttributeValues: { ':q': { S: query } }
+        }
       : {})
   })
 
