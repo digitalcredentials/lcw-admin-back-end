@@ -115,12 +115,14 @@ Resources:
           - PUT
           - DELETE
           - OPTIONS
+        # Every header a signed request carries is named here. API Gateway
+        # does not treat '*' as a wildcard when other headers are listed, and
+        # it answers a preflight for an unlisted header with no CORS headers,
+        # so the browser refuses the request. Authorization must be named
+        # regardless: the Fetch standard excludes it from '*'.
         AllowHeaders:
-          - '*'
-          # Named as well as wildcarded: the Fetch standard excludes
-          # Authorization from the '*' expansion, and while browsers do accept
-          # it today, nothing here should depend on that.
           - Authorization
+          - Capability-Invocation
           - Content-Type
           - Digest
 
