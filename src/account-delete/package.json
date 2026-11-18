@@ -1,6 +1,7 @@
 {
   "name": "lcw-admin-account-delete",
   "version": "1.0.0",
+  "license": "MIT",
   "private": true,
   "description": "Removes a wallet account row, recording it first",
   "type": "module",
