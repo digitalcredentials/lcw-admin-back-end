@@ -1,5 +1,10 @@
 # LCW Admin API
 
+> [!IMPORTANT]
+> **Alpha.** This is part of the Learner Credential Wallet alpha, an early test
+> version. It may change without notice. We read issues, but may not answer or
+> fix them during the alpha.
+
 Administration of **Learner Credential Wallet accounts**: viewing them,
 searching them, listing who agreed to be contacted, and deleting them. An
 HTTP API of AWS Lambda functions behind a zcap-signature authorizer, deployed
@@ -295,3 +300,7 @@ sam deploy --stack-name lcw-admin-api --resolve-s3 --capabilities CAPABILITY_IAM
   this code carries. If a deployment ever predates that attribute, its older
   records will be missing from `GET /audit` (though still visible under the
   account) until they are backfilled.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

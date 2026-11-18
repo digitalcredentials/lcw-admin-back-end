@@ -1,6 +1,7 @@
 {
   "name": "lcw-admin-functions",
   "version": "1.0.0",
+  "license": "MIT",
   "private": true,
   "description": "Build root for the bundled handlers: holds the deps they share and the code in src/shared",
   "type": "module",

@@ -1,6 +1,7 @@
 {
   "name": "lcw-admin-backend",
   "version": "1.0.0",
+  "license": "MIT",
   "description": "Admin API for Learner Credential Wallet accounts, on AWS SAM",
   "private": true,
   "type": "module",

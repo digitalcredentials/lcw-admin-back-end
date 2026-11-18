@@ -1,6 +1,7 @@
 {
   "name": "lcw-admin-authorizer",
   "version": "1.0.0",
+  "license": "MIT",
   "private": true,
   "description": "HTTP API REQUEST authorizer admitting zcap invocations from registered admin DIDs",
   "type": "module",
